@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "universal-brain"
+version = "0.6.0"
+description = "Domain-independent cognitive core: reasoning, hypotheses, uncertainty, planning, decision, memory, strategy, and self-monitoring, decoupled from any specific project."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+similarity = ["scikit-learn>=1.3"]  # only needed for TfidfCosineScorer (similarity.py, Phase 11);
+                                    # LexicalOverlapScorer (default everywhere) and
+                                    # LLMSemanticScorer need nothing beyond the base install
+
+[tool.setuptools.packages.find]
+include = ["brain*"]

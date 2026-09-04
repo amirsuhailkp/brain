@@ -1,0 +1,368 @@
+Metadata-Version: 2.4
+Name: universal-brain
+Version: 0.6.0
+Summary: Domain-independent cognitive core: reasoning, hypotheses, uncertainty, planning, decision, memory, strategy, and self-monitoring, decoupled from any specific project.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+
+# Universal Brain — Phase 1 + 2 + 3 + 4 + 5 + 6
+
+A domain-independent cognitive core:
+
+```
+perceive
+  -> meta-reasoning: compute process-quality signals, decide escalation
+  -> reason (hypotheses + candidate actions, using active Strategy's
+     planning directive, optionally on a stronger LLM this step)
+  -> decide (deterministic, real expected information gain, weighted by
+     the active Strategy)
+  -> challenge (deterministic self-critique)
+  -> validate -> act -> observe
+  -> update beliefs (deterministic, gated by Verification Engine)
+  -> record calibration data, extract per-observation experience
+  -> update uncertainty -> on stall/rejection-loop: try switching
+     Strategy (bounded) before actually stopping
+  -> extract episode-summary experience
+
+  -> at end of run: build a retrospective ReasoningQualityReport
+     (Phase 6) - flags oscillating hypotheses, overconfidence, forced
+     strategy switches, heavy self-critique overrides; downweights and
+     tags the episode Experience if the run's own reasoning looked
+     unreliable
+
+(separately, periodic/batch, NOT part of the loop above:)
+consolidate accumulated Experiences -> Principles
+```
+
+Phases 1-6 implemented and tested (44/44). Not yet connected to agent65 —
+proven against two structurally different toy environments.
+
+## Why it's smaller than the original spec
+
+Same principle as every prior phase, applied to Phase 5's three asks
+(Meta-Reasoning, Strategy Selection, Model Escalation):
+
+- **"Strategy" is 3 fixed, hand-written parameter bundles**
+  (`strategy.py`), not a pluggable framework or an LLM-authored policy. A
+  strategy IS a `(decision-weight-tweak, planning-prompt-directive)` pair:
+  BALANCED (the Phase 2-4 default), CHEAP_FIRST (bias toward cheap fast
+  actions), AGGRESSIVE_FALSIFICATION (bias toward disproving the leading
+  hypothesis, not confirming it). This is deliberately the smallest thing
+  that makes "change direction" real instead of theater, per Phase 3's
+  `controller.py` note that flagged this as deferred.
+- **Strategy selection is a fixed priority order, not learned.** Same
+  "the Brain decides deterministically" rule as every other engine here —
+  `StrategySelector.select_next()` just walks a priority list of untried
+  strategies. No ML, no scoring model.
+- **Model escalation is two `PlanningEngine` instances, not a router
+  abstraction.** `Brain(llm, ..., strong_llm=...)` — if `strong_llm` is
+  provided, a second `PlanningEngine` wraps it and `core.py` picks between
+  them per-step based on `meta.should_escalate()`. No cost paid for
+  escalation machinery when nobody's using it (`self.planning_strong` is
+  simply `None`). This maps directly onto agent65's actual two-model
+  setup (qwen3:4b hot loop / qwen3:8b deep assessment).
+- **Meta-reasoning is 4 signals, not a general self-reflection engine**
+  (`meta.py`): challenger intervention count, rejected-action count, Brier
+  score / overconfidence from the Phase 4 `CalibrationTracker`, and "is
+  any hypothesis about to cross the confirmation threshold on thin
+  evidence." Escalate if any one fires — not a tuned weighted score,
+  since these are meant to be rare, cheap, individually explainable
+  triggers.
+
+## A real bug this phase's testing caught
+
+`VagueGuesser` (the Phase 3 mock that always proposes non-distinguishing
+"experiments") was re-run against `GuessNumberAdapter` to check the new
+stall-to-strategy-switch behavior, and instead of switching strategy it
+just silently burned the full 20-step budget. Cause: `VagueGuesser`
+always guesses the literal number 50 regardless of the current bounds, so
+once the bounds narrowed past 50, `validate()` started rejecting *every*
+action — and the rejection branch in `core.py` did `continue` straight
+past the stall-check further down the loop body, every single time. A
+rejected action never reaches `hypotheses.update_from_observation`, so
+`uncertainty_history` never updates either way — this failure mode is
+invisible to `is_stalled()`, which only watches uncertainty. The Brain
+was stuck proposing an invalid action forever with nothing able to notice.
+
+Fixed with a second, independent check: `controller.is_rejection_looping()`
+watches `state.actions_taken` directly for a run of consecutive REJECTED
+actions, and the rejection branch now tries a strategy switch (same
+bounded mechanism as a stall) before continuing. Verified with a debug
+run: before the fix, `VagueGuesser` reached `max_steps_reached` at step 20
+having spammed the same rejected guess 19 times; after the fix, it
+correctly detects the loop, tries 2 strategy switches, and stops honestly
+at step 7 with `stop_reason="stuck_repeated_invalid_actions"`.
+
+A second, smaller issue found while reviewing (not caught by a failing
+test, by inspection): `_try_change_strategy`'s tried-strategy tracking
+re-parsed the human-readable log message string to reconstruct which
+strategies had already been tried, including one dead line that iterated
+an empty list and did nothing. It happened to produce correct results
+only because `max_strategy_switches` defaults to exactly the number of
+non-default strategies in the library — a coincidence, not a guarantee.
+Replaced with an explicit `state.strategies_tried: list[str]` field
+instead of parsing prose.
+
+## Phase 6 — Reasoning-Quality Evaluation & Self-Monitoring
+
+The spec's own Phase 5 numbering ("reasoning-quality evaluation, strategy
+selection, model selection, escalation, self-monitoring") is mostly
+already built — strategy selection, model escalation, and the four
+meta-reasoning signals came in under what we've been calling Phase 5.
+Rather than re-label existing code as "Phase 6" to fill a phase number,
+this phase builds only the piece that was genuinely missing: **a
+retrospective account of the run's own reasoning process**, as opposed
+to the in-the-moment signals `meta.py` already computes and immediately
+discards after each step's escalate/switch decision.
+
+Two concrete gaps this closes:
+
+1. **Oscillation detection.** `calibration.py` only ever looks at a
+   single `(confidence_at_test, matched)` pair per hypothesis test — it
+   has no notion of a hypothesis's *shape* over time. A hypothesis whose
+   confidence bounces `0.5 -> 0.8 -> 0.3 -> 0.75 -> 0.35` looked
+   identical to calibration as one that climbs cleanly toward a verdict,
+   provided the final Brier contributions happened to average out
+   similarly. `reasoning_quality.py` tracks each hypothesis's full
+   `confidence_history` (new field on `Hypothesis`, seeded with the
+   opening prior, appended on every `update_from_observation`) and counts
+   direction reversals — 2+ reversals flags real flip-flopping, not
+   ordinary noisy revision.
+2. **Feeding self-monitoring back into memory.** Before Phase 6, a run
+   that flailed its way to the goal (heavy challenger overrides, forced
+   strategy switches, overconfidence) produced exactly the same kind of
+   episode-summary `Experience`, weighted exactly the same, as a run
+   that reasoned cleanly. `core.py` now builds one
+   `ReasoningQualityReport` per run (attached as `state.quality_report`)
+   and, if it's flagged low-quality, downweights that run's
+   episode-summary `Experience` importance by 0.6x and tags it
+   `"low_reasoning_quality"` — so noisy runs don't generalize into Brain
+   Memory with full weight. This is Principle 12 ("learn general
+   principles, not indiscriminately") applied to the Brain's own process,
+   not just world-facts.
+
+Verified with a real `VagueGuesser` run (the mock that always proposes a
+fixed, eventually-invalid guess): the resulting report showed 7
+challenger overrides, 2 forced strategy switches, and 6 rejected actions
+— three independent, individually-explainable flags, `overall_quality`
+correctly dropping to 0.3, not a synthetic unit-test-only case.
+
+**What Phase 6 deliberately did NOT build:** a general "reasoning quality
+score" that gets fed back as a *scalar into decision-making mid-run* (e.g.
+"if quality is dropping, become more conservative this step"). That would
+be a second, overlapping control mechanism on top of the existing
+stall/rejection-loop/strategy-switch machinery, and nothing yet
+demonstrates that the two would agree rather than fight each other. The
+report is currently read-only within a run (informational + logged) and
+only actually changes behavior *after* the run ends, at the memory-write
+step — a deliberately narrow, low-risk place to close the gap first.
+
+## Installing / connecting from another repo (e.g. agent65)
+
+This is now a real installable package, not a directory that needs
+`sys.path` hacking to import - `pyproject.toml` was missing until this
+pass, which mattered less while everything ran inside this one repo's
+tests but would have been a real blocker for `agent65` (a separate repo)
+actually depending on it.
+
+```bash
+# from agent65's repo, or any consumer:
+pip install -e /path/to/brain
+# or, once published: pip install universal-brain
+```
+
+```python
+from brain import Brain, Goal, JsonlMemory
+from brain.interfaces import ProjectAdapter, LLMInterface
+```
+
+Only the `brain/` package itself is installed - `toy_envs/`, `tests/`,
+and `examples/` stay dev-only, since a real consumer only ever needs the
+core package, never the toy environments used to validate it.
+
+## Layout
+
+```
+brain/
+  models.py          - + strategy/meta fields on WorkingState (active_strategy,
+                        strategy_switches, strategies_tried, strategy_log,
+                        escalations, quality_report); Hypothesis now tracks
+                        confidence_history for oscillation detection
+  interfaces.py       - LLMInterface, ProjectAdapter, MemoryBackend
+  memory.py           - JSONL memory backend + importance scoring
+  hypotheses.py        - HypothesisEngine: LLM proposes, code owns belief revision
+  verification.py      - Principle 6 gate: plausible not confirmed
+  uncertainty.py        - compute_uncertainty(): pure, concave-in-confidence
+  information_gain.py   - expected_information_gain(): real expected-value calc
+  planning.py            - PlanningEngine: prompt + candidates, + strategy_directive param
+  decision.py             - DecisionEngine: scoring now weighted by active Strategy
+  challenger.py            - Self-critique: two narrow deterministic checks
+  controller.py             - is_stalled() + is_rejection_looping() (Phase 5)
+  strategy.py               - Strategy dataclass, 3-strategy LIBRARY, StrategySelector
+  meta.py                   - compute_signals(), should_escalate(), should_change_strategy()
+  extraction.py             - Phase 4: per-observation Experience extraction
+  consolidation.py          - Phase 4: Experience clustering into Principle
+  calibration.py            - Phase 4: CalibrationTracker, Brier score, reliability curve
+  reasoning_quality.py      - Phase 6: retrospective ReasoningQualityReport,
+                              oscillation detection, is_low_quality gate
+  core.py                   - Brain: orchestrates the full cycle. No domain imports.
+toy_envs/
+  guess_number.py     - numeric bisection toy
+  word_lock.py        - combinatorial word-guess toy (purely exploratory, no hypotheses)
+tests/
+  mock_llm.py         - deterministic LLMs incl. one that gets stuck repeating an invalid guess
+  test_brain.py       - 44 tests across all six phases + gap-closing cleanup
+examples/
+  claude_llm_adapter.py - reference adapters for Claude API and local Ollama
+```
+
+## Run the tests
+
+```bash
+cd universal-brain
+python -m pytest tests/test_brain.py -v
+```
+
+## What each Phase 5 piece actually proves
+
+- `test_decision_engine_strategy_override_changes_cost_sensitivity` -
+  CHEAP_FIRST's higher cost_sensitivity actually changes which candidate
+  wins vs. BALANCED, not just a label on the Decision object.
+- `test_full_run_switches_strategy_on_stall_before_giving_up` - a stuck
+  real run shows `strategy_switches > 0` and a non-default
+  `active_strategy`, not just an immediate stop.
+- `test_strategy_switches_are_bounded_never_infinite` -
+  `max_strategy_switches` is actually respected; the Brain can't
+  strategy-hop forever.
+- `test_meta_reasoning_flags_hypothesis_near_confirmation_for_escalation`
+  / `..._overconfidence_from_calibration_tracker` - the two most
+  important escalation triggers fire on exactly the synthetic cases they
+  should and not on their negatives.
+- `test_strong_llm_actually_gets_used_when_provided_and_escalation_triggers`
+  - confirmed via a live debug run (not just the unit test) that
+  escalation actually routes a real planning call to the strong model
+  mid-run and the goal still gets reached normally.
+- `test_no_strong_llm_provided_never_escalates` - escalation machinery
+  costs nothing and does nothing when `strong_llm` isn't provided.
+
+## What each Phase 6 piece actually proves
+
+- `test_oscillating_hypothesis_is_flagged_monotonic_is_not` - a
+  flip-flopping confidence trajectory gets flagged and scores lower than
+  a clean monotonic climb with the same number of updates - proves this
+  is measuring *direction changes*, not just "confidence moved a lot."
+- `test_short_confidence_history_never_counts_as_oscillating` - a
+  hypothesis with only one update can't be flagged, since a single
+  direction change isn't flip-flopping by definition.
+- `test_quality_report_accumulates_flags_and_penalizes_score` - each
+  independent problem shows up as its own named, inspectable flag
+  (Principle 13), and `overall_quality` actually drops as flags
+  accumulate rather than being a single opaque number.
+- `test_clean_run_report_is_not_low_quality` - a run with nothing wrong
+  produces zero flags - the point is catching real unreliability, not
+  manufacturing noise on every run.
+- `test_clean_solved_run_gets_attached_high_quality_report` /
+  `test_escalations_are_counted_across_the_run` - integration-level:
+  `Brain.run()` always attaches a `quality_report`, and `escalations`
+  correctly accumulates across the whole run rather than being
+  recomputed-and-discarded each step like `meta.py`'s signals.
+- `test_low_quality_run_experience_is_tagged_and_downweighted` - a real
+  stuck `VagueGuesser` run (7 challenger overrides, 2 strategy switches,
+  6 rejected actions in a live run, not synthetic) gets its episode
+  Experience tagged `low_reasoning_quality` with importance cut to 0.6x -
+  confirming the feedback into memory actually fires end-to-end.
+
+## Connecting a real project (e.g. agent65)
+
+Implement `ProjectAdapter`:
+
+- `perceive()` - dict of current facts (recon results, session state, etc.)
+- `available_actions(world_model)` - which action *kinds* are legal right now
+- `validate(action, world_model)` - catches scope drift, malformed params,
+  duplicate actions **before** execution - this is where agent65's existing
+  validation logic (hypothesis_engine.py, tools_registry.yaml checks) moves to
+- `execute(action)` - dispatches to the Kali SSH runner / diff_requests / etc.
+- `is_goal_met(world_model)` (optional) - e.g. confirmed finding recorded
+- `project_memory_context(query)` (optional) - pull relevant playbook entries
+
+Nothing about SQLi, IDOR, or Kali should ever appear inside `brain/`.
+
+For model escalation specifically: this is the natural place to plug in
+agent65's actual qwen3:4b (hot) / qwen3:8b (strong) split -
+`Brain(hot_ollama_llm, project, brain_memory, project_memory, strong_llm=deep_ollama_llm)`.
+See `examples/claude_llm_adapter.py`'s `OllamaLLM` for the reference
+adapter; point `model` at each respective model name.
+
+## What's deliberately NOT here yet
+
+- Confidence calibration is still not auto-applied to belief updates
+  (unchanged from Phase 4 - still needs real project volume to be
+  trustworthy).
+- Real semantic (embedding-based) clustering for consolidation.
+- Cross-hypothesis contradiction detection.
+- Strategies are hand-written, not learned or LLM-authored - synthesizing
+  new strategies from consolidated Principles is a real future candidate,
+  but needs real usage data to judge whether it's worthwhile at all.
+- The Phase 6 quality report is read-only mid-run (logged, and used only
+  at the memory-write step at the end) - it does not yet feed back into
+  in-run decision-making (e.g. becoming more conservative the moment
+  quality starts dropping). See the Phase 6 section above for why that
+  was deliberately deferred rather than built speculatively.
+- Escalation currently only affects the reasoning/planning step, not
+  hypothesis belief-update math itself - a "the strong model should also
+  double-check a near-confirmation before it locks in" verification-time
+  escalation is a reasonable, narrow follow-up.
+- Benchmark suite vs. a non-Brain baseline agent65.
+
+## Gaps closed in this pass
+
+Three previously-flagged issues were real enough to fix now rather than
+defer again:
+
+- **`information_gain._simulated_uncertainty` no longer duplicates
+  confidence-update math.** Extracted `hypotheses.update_confidence()` as
+  the single source of truth for the belief-update rule; both the real
+  update (`hypotheses.update_from_observation`) and the simulated one
+  (`information_gain.expected_information_gain`) now call it. Flagged
+  since Phase 3 as a drift risk — closed, not just re-flagged.
+- **`max_strategy_switches` is derived, not a coincidental hardcoded
+  constant.** Was `2`, which happened to equal `len(LIBRARY) - 1` (the
+  number of non-BALANCED strategies) by luck rather than by construction.
+  Now computed from `len(STRATEGY_LIBRARY) - 1` at `Brain.__init__` time,
+  with an explicit override still available. Verified the derived value
+  matches the old hardcoded one exactly, so this changes nothing about
+  current behavior — only removes the trap for when the library grows.
+- **`Principle` supersession**, unresolved since Phase 4: `PrincipleStore`
+  now has `store_generation()`, which marks an existing active Principle
+  `superseded_by` a new one when they cover substantially the same
+  evidence (Jaccard overlap of `supporting_experience_ids` ≥ 0.5, same
+  project scope) rather than leaving two consolidation passes over
+  growing history silently indistinguishable. Old records are never
+  deleted (Principle 13: inspectable) — `active()` is what filters for a
+  caller that only wants current guidance. Cross-project principles and
+  low-overlap principles are explicitly tested to never cross-supersede.
+
+## Known gaps still open (deliberately not fixed here)
+
+- `REJECTION_STREAK_LIMIT = 4` (controller.py) and the strategy priority
+  order in `strategy.py`'s `_SWITCH_PRIORITY` are both hand-picked, not
+  calibrated against real outcome data - same category of gap as
+  `STALL_WINDOW`/`STALL_EPSILON` flagged in earlier phases. Left alone
+  deliberately: tuning these against toy-environment behavior would be
+  overfitting to toys, not real signal. This is exactly the kind of
+  constant that should be revisited once agent65 is generating volume,
+  not before.
+- Real semantic (embedding-based) clustering for consolidation - still
+  tag-overlap only. Reasonable upgrade, not an architectural gap; adding
+  an embedding dependency before there's a real corpus to cluster would
+  be premature.
+- Cross-hypothesis contradiction detection (e.g. two ACTIVE hypotheses
+  that structurally can't both be true) - genuinely not built. Judged
+  lower priority than the three items above because nothing in the toy
+  environments or agent65's existing hypothesis flow has yet produced a
+  concrete case of this causing a wrong decision - a real instance from
+  actual usage would make a much better test than an invented one.
+- Benchmark suite vs. a non-Brain baseline agent65 - still deferred until
+  there's a real `ProjectAdapter` to benchmark.
