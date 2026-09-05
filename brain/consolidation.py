@@ -23,6 +23,10 @@ that needs a new engine.
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .interfaces import LLMInterface
 
 from .models import Experience, Principle
 from .similarity import SimilarityScorer
@@ -36,6 +40,7 @@ def consolidate(
     min_cluster_size: int = MIN_CLUSTER_SIZE,
     scorer: SimilarityScorer | None = None,
     similarity_threshold: float = JACCARD_THRESHOLD,
+    llm: "LLMInterface | None" = None,
 ) -> list[Principle]:
     """Pure function: takes accumulated Experience records, returns
     Principles for any cluster large enough to generalize from. Does not
@@ -50,7 +55,13 @@ def consolidate(
     together — something tag matching can never do since it requires the
     literal tag strings to match. Opt-in, not a default change, so every
     pre-Phase-11 call site (including the full existing test suite) sees
-    identical output."""
+    identical output.
+
+    `llm` (Phase 18c): None (the default) preserves the exact original
+    synthesis path — deterministic, no LLM cost. When provided, clusters
+    with no dominant lesson (agreement < 60%) get an LLM-assisted synthesis
+    instead of the old raw-concatenation fallback. Opt-in; every pre-Phase-18c
+    call site is unaffected."""
     if scorer is None:
         clusters = _cluster_by_tag_overlap(experiences)
     else:
@@ -60,7 +71,7 @@ def consolidate(
     for cluster in clusters:
         if len(cluster) < min_cluster_size:
             continue
-        principles.append(_synthesize_principle(cluster))
+        principles.append(_synthesize_principle(cluster, llm=llm))
     return principles
 
 
@@ -114,13 +125,38 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(union)
 
 
-def _synthesize_principle(cluster: list[Experience]) -> Principle:
-    """Deterministic, LLM-free synthesis: pick the most common lesson text
-    verbatim if the cluster mostly agrees, otherwise concatenate the
-    distinct lessons so nothing is silently dropped. An LLM-assisted
-    summarizer that produces smoother natural-language principles is a
-    reasonable upgrade, not an architectural requirement — kept out here
-    so consolidation stays fast and deterministically testable."""
+def _synthesize_principle(
+    cluster: list[Experience],
+    llm: "LLMInterface | None" = None,
+) -> Principle:
+    """Deterministic synthesis with optional LLM-assisted summarization
+    (Phase 18c).
+
+    The original approach:
+      - If >= 60% of the cluster agrees on one lesson verbatim → use it.
+      - Otherwise → concatenate up to 3 raw lesson strings with " | ".
+
+    The problem with the fallback: the concatenated string is rarely
+    coherent enough to be useful as a planning prompt directive. It's
+    long, internally inconsistent, and carries no synthesis — it's just
+    three lessons glued together. The consolidation docstring itself
+    called out "an LLM-assisted summarizer that produces smoother
+    natural-language principles is a reasonable upgrade." Now we have the
+    LLMInterface seam to do it.
+
+    Wired narrowly, same scoping discipline as every prior opt-in scorer:
+      - Only fires when there is no dominant lesson (agreement < 60%) AND
+        the cluster has multiple distinct lessons — the case where the
+        old concatenation approach was weakest.
+      - A 60%+ agreeing cluster is already a clean principle; running an
+        LLM over it would add cost with no quality gain.
+      - A single-lesson cluster is trivially synthesized; same.
+      - Fails gracefully (falls back to the original concatenation) on
+        any LLM error or malformed output — a synthesis failure must
+        never prevent a consolidation pass from completing.
+
+    `llm` is None by default → behavior identical to every pre-Phase-18c
+    call site."""
     lesson_counts: dict[str, int] = defaultdict(int)
     for exp in cluster:
         lesson_counts[exp.lesson] += 1
@@ -131,12 +167,35 @@ def _synthesize_principle(cluster: list[Experience]) -> Principle:
 
     if agreement >= 0.6 or len(ranked) == 1:
         statement = dominant_lesson
+    elif llm is not None:
+        # Multiple distinct lessons — ask the LLM to synthesize a single
+        # coherent principle from what the cluster collectively learned.
+        distinct = [lesson for lesson, _ in ranked[:5]]
+        prompt = (
+            "You are summarizing a set of related lessons learned by an AI "
+            "reasoning system across multiple tasks. Synthesize the following "
+            "lessons into ONE clear, concise principle (one sentence, under 80 "
+            "words) that captures what they have in common and what should be "
+            "remembered for future tasks. Do not list them — distill them.\n\n"
+            "Lessons:\n"
+            + "\n".join(f"- {l}" for l in distinct)
+            + '\n\nRespond ONLY with JSON: {"principle": "your one-sentence synthesis"}.'
+        )
+        try:
+            raw = llm.propose(prompt, '{"principle": "..."}')
+            statement = str(raw.get("principle", "")).strip()
+            if not statement:
+                raise ValueError("empty principle from LLM")
+        except Exception:
+            # Fail gracefully: same concatenation as before
+            distinct_short = [lesson for lesson, _ in ranked[:3]]
+            statement = "Multiple related lessons observed: " + " | ".join(distinct_short)
     else:
         distinct = [lesson for lesson, _ in ranked[:3]]
         statement = "Multiple related lessons observed: " + " | ".join(distinct)
 
     project_ids = {exp.project_id for exp in cluster}
-    project_id = next(iter(project_ids)) if len(project_ids) == 1 else None  # None if it spans projects
+    project_id = next(iter(project_ids)) if len(project_ids) == 1 else None
 
     return Principle(
         statement=statement,

@@ -267,6 +267,35 @@ class Brain:
             obs = Observation(action_id=action.id, result=raw_result, success=success)
             state.observations.append(obs)
 
+            if action.status == ActionStatus.FAILED:
+                # Phase 18b: a FAILED execution (success=False from execute())
+                # is a tooling/environment failure, not real-world evidence
+                # about a hypothesis. The original code ran
+                # update_from_observation() unconditionally — which meant the
+                # error string in raw_result was treated as an observation,
+                # _outcome_matches_true_branch fell back to
+                # bool(obs.success) == False, and the hypothesis got a piece
+                # of CONTRADICTING evidence recorded against it, silently,
+                # every time a tool crashed. This corrupts confidence_history
+                # and calibration for any hypothesis that happened to be
+                # under test when the tool failed.
+                #
+                # The observation IS still appended above (inspectability,
+                # Principle 13; the failure is visible in state), and
+                # experience extraction still runs below (so "this action kind
+                # fails in this state" IS learned). Only the hypothesis belief
+                # update and calibration recording are skipped — those two
+                # steps require a real observation of the world, which a tool
+                # crash isn't.
+                self._extract_and_store_observation_experience(state, action, obs, hyp_before, None)
+                state.world_model.update(self.project.perceive())
+                if controller.is_stalled(state) or controller.is_in_action_rut(state):
+                    switched, current_strategy = self._try_change_strategy(state, current_strategy)
+                    if not switched:
+                        state.stopped = True
+                        state.stop_reason = "stalled_strategies_exhausted"
+                continue
+
             self.hypotheses.update_from_observation(
                 state,
                 action,
@@ -286,7 +315,7 @@ class Brain:
 
             state.world_model.update(self.project.perceive())
 
-            if controller.is_stalled(state):
+            if controller.is_stalled(state) or controller.is_in_action_rut(state):
                 switched, current_strategy = self._try_change_strategy(state, current_strategy)
                 if not switched:
                     state.stopped = True

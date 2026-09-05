@@ -493,6 +493,67 @@ that they matter:
    which of these fifteen phases is actually pulling its weight day to
    day.
 
+## Phase 18 — Three More Real Bugs, Found by Reading the Code
+
+**18a — Action-rut detection (`controller.py`)**
+
+`is_stalled()` checks whether uncertainty has plateaued — the Brain is acting
+but not learning. But there's a distinct failure mode it misses: a Brain whose
+uncertainty IS moving (so no stall fires) but is executing the same action kind
+every single step. The DecisionEngine keeps picking the same winner because
+nothing else scores better — but that means the available action space is not
+being explored. A run in this rut burns its step budget making marginally
+different versions of the same call.
+
+New `is_in_action_rut(state)` checks whether the last `ACTION_RUT_STREAK` (5)
+EXECUTED actions all had the same kind. Deliberately excludes rejected and
+failed actions (rejection streaks are already caught by `is_rejection_looping`;
+failures aren't "won't diversify"), and excludes `"stop"` (a deliberate terminal
+decision). Wired into `core.py` alongside the stall check — triggers the same
+`_try_change_strategy` path, so a rut gets a strategy switch before it becomes
+a hard stop.
+
+**18b — Failed executions must not corrupt hypothesis beliefs (`core.py`)**
+
+When `project.execute(action)` returned `(False, "ToolError: timeout")`, the
+original code still called `hypotheses.update_from_observation()` with
+`obs.success = False`. Inside `_outcome_matches_true_branch`, the absence of
+any matching prediction text caused a fallback to `bool(observation.success) ==
+False`, recording the tool crash as a piece of **contradicting evidence** against
+the hypothesis under test. Silently, for every tool failure, forever.
+
+This corrupts `confidence_history` and the `calibration_tracker` for any
+hypothesis that happened to be tested when a tool crashed — making Brain
+progressively less confident in hypotheses that are actually correct, just
+because the environment is flaky.
+
+Fix: when `action.status == ActionStatus.FAILED`, `core.py` skips
+`update_from_observation` and calibration recording entirely, then `continue`s
+to the next step. The observation IS still appended (Principle 13 —
+inspectability; the failure is visible in state), and experience extraction
+still runs (so "this action kind fails in this state" is learned as a lesson).
+Only hypothesis beliefs and calibration are protected.
+
+**18c — LLM-assisted principle synthesis (`consolidation.py`)**
+
+`_synthesize_principle()` fell back to raw concatenation (`"Multiple related
+lessons observed: A | B | C"`) when no single lesson dominated a cluster. The
+consolidation module's own docstring called this out: *"an LLM-assisted
+summarizer that produces smoother natural-language principles is a reasonable
+upgrade."* Now that every scorer in this codebase uses the same `LLMInterface`
+seam, doing it required adding one parameter.
+
+`_synthesize_principle(cluster, llm=None)` and `consolidate(..., llm=None)` —
+fully opt-in, zero behavior change without it. When an LLM is provided, it only
+fires for clusters where no lesson dominates (agreement < 60% AND multiple
+distinct lessons exist) — the exact case where concatenation was weakest. A
+60%+ agreeing cluster is already a clean principle; a single-lesson cluster is
+trivially synthesized; neither needs an LLM call. Fails gracefully on any error
+or empty response (falls back to the original concatenation), so a single bad
+model call can never prevent a consolidation pass from completing.
+
+167/167 tests pass (146 prior + 21 new), zero regressions.
+
 ## Phase 17 — Three Real Bugs Found by Reading the Code (not speculative improvements)
 
 Phase 17 is three distinct bug fixes identified by reading the actual
