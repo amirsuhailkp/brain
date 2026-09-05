@@ -401,6 +401,243 @@ backward-compatible no-argument path, and confirming the bonus can't
 override a much higher information-gain alternative. 98/98 total tests
 passing.
 
+## Phase 15 — Verification-Time Confirmation Review (closing the escalation gap the README itself had flagged)
+
+Every prior phase's escalation work (Phase 5's `should_escalate`, Phase 8's
+domain-familiarity trigger, Phase 13's contradiction trigger) escalates the
+**planning** step — it makes the next reasoning call use the strong model.
+But re-reading `meta.py` next to `hypotheses.py` surfaced a real gap none
+of that touched: the actual moment a hypothesis flips to CONFIRMED happens
+one call earlier, inside `update_from_observation`, and it is pure
+arithmetic (`verification.can_confirm` — a confidence number and an
+evidence count) that never sees a model at all, strong or otherwise.
+`meta.py` already had a signal named exactly for this moment
+(`hypothesis_near_confirmation`) and used it to escalate the *next*
+planning step — but by then the hypothesis had already locked in. The
+escalation was real; it was just escalating the step after the one that
+actually mattered. This was the literal gap this README named at the end
+of the Phase 6-era notes: *"the strong model should also double-check a
+near-confirmation before it locks in."*
+
+**`brain/confirmation_review.py` (new)** — `ConfirmationReviewer` is a
+pluggable interface (same shape as Phase 13's `ContradictionScorer`):
+`review(statement, evidence) -> (approved, reason)`. `LLMConfirmationReviewer`
+asks whatever LLM is wired in (in practice, the strong one) whether the
+evidence genuinely supports the specific claim or is coincidental/too
+thin — a judgment about the *content* of the evidence, not something a
+count-and-threshold check can make, which is exactly why `verification.py`
+already flagged "a real correlated-evidence discount is future work."
+
+Wired narrowly, same scoping discipline as Phase 13/14:
+
+- **Thin-evidence gate only** (`needs_review`, `THIN_EVIDENCE_MAX = 2` —
+  deliberately the same bar `meta.py`'s own `NEAR_CONFIRMATION_MAX_EVIDENCE`
+  already uses, not a separately-tuned number). A hypothesis confirmed on a
+  long, boring trail of consistent evidence never pays for a review call.
+- **Can only make Brain more conservative, never less** — it only ever
+  looks at hypotheses that already passed the deterministic
+  `verification.can_confirm` gate; it cannot confirm something the gate
+  said no to, only hold back something the gate said yes to.
+- **A hold is a "not yet," not a veto.** `hyp.status` stays ACTIVE, the
+  hold reason is recorded in `state.confirmation_holds` (inspectable,
+  Principle 13) and surfaced in the next planning prompt (a new
+  `HELD CONFIRMATIONS` block, same treatment as Phase 13's
+  `UNRESOLVED CONTRADICTIONS`), and a new `meta.py` signal
+  (`unresolved_confirmation_hold`) escalates the *next* planning step too
+  — so the model picking what to test next actually knows a hold exists,
+  not just that a review happened somewhere. As soon as evidence is no
+  longer thin (more of it accumulates) or a later review approves it, the
+  hold clears and confirmation proceeds normally.
+- **Fails OPEN, not closed** — an exception or malformed reviewer response
+  approves rather than blocks, same reasoning as `LLMContradictionScorer`:
+  a bad model call must never permanently strand an otherwise-earned
+  confirmation.
+- **Runs before the contradiction check, not after** — a held hypothesis
+  never actually reaches CONFIRMED this step, so there is nothing new to
+  check for contradiction against other CONFIRMED beliefs; Phase 13's gate
+  is simply moot for a held confirmation, not bypassed.
+
+Fully opt-in (`Brain(..., confirmation_reviewer=...)`) — omit it and
+behavior is byte-for-byte identical to every pre-Phase-15 call site.
+
+One small, honest housekeeping fix alongside this: `brain/contradiction.py`
+(`ContradictionScorer`, `LLMContradictionScorer`, `find_active_tensions`)
+had never actually been exported from `brain/__init__.py` despite every
+other scorer (`similarity.py`'s three implementations) being exported
+there — a caller wiring up Phase 13/14 from outside this package had to
+reach into the private module path. Fixed alongside Phase 15's own new
+exports, not left for a future session to rediscover.
+
+122/122 tests pass (110 prior + 12 new).
+
+**Where things stand overall:** the confidence/decision core (Phases 1-7)
+remains untouched. Phases 8-15 have each closed a distinct, *verified* gap
+— found by reading the code against its own stated design, never invented
+speculatively. Honest next candidates, in rough order of how sure this is
+that they matter:
+
+1. **A real end-to-end run** — against a live LLM (freellmapi or
+   otherwise) and a real `ProjectAdapter` (agent65, once it's ready).
+   Every phase through 15 has been proven in isolation with unit/
+   integration tests; nothing has run as one live loop yet, and that's
+   the check no amount of reading code can substitute for.
+2. **Embedding-based similarity** as a fourth `SimilarityScorer`
+   implementation, sitting between the free `TfidfCosineScorer` and the
+   per-call-cost `LLMSemanticScorer` — cheaper than an LLM call, more
+   robust than word/tag overlap, useful once there's a real corpus of
+   Principles/Experiences to cluster (premature before that, per the
+   README's own long-standing note on this).
+3. Something surfaced by actually using it, once a real project is wired
+   in — the same honest limitation every session has repeated: invented
+   test cases can prove the mechanism works, but only real usage surfaces
+   which of these fifteen phases is actually pulling its weight day to
+   day.
+
+## Phase 17 — Three Real Bugs Found by Reading the Code (not speculative improvements)
+
+Phase 17 is three distinct bug fixes identified by reading the actual
+implementations against their stated design intent, not by inventing new
+capability. All three were silently wrong — no test had caught any of them
+because the corrupted outputs were valid Python values and the wrong behavior
+was a plausible-but-incorrect result, not a crash.
+
+**17a — Word-boundary matching in `_outcome_matches_true_branch`
+(`hypotheses.py`)**
+
+The original implementation used raw substring containment (`predicted_if_true
+in actual`) to decide whether an observation matched the "true" or "false"
+branch of a hypothesis test. This silently misfires on short prediction
+tokens — exactly the vocabulary an LLM naturally produces when asked to predict
+outcomes in plain English:
+
+- `"high"` matches observations containing `"highway"`, `"highlight"`,
+  `"highly"`
+- `"low"` matches `"flow"`, `"below"`, `"allow"`
+- `"yes"` matches `"yesterday"`, `"bytes"`
+
+A false positive here means a contradicting observation is recorded as
+supporting evidence — or the reverse — corrupting the confidence trajectory and
+calibration tracker for that hypothesis silently for the rest of the run, with
+no error, because the `matched=True/False` path executes normally either way.
+
+Fixed using negative lookaround regex (`(?<!\w)token(?!\w)`) for short tokens
+(< 20 chars), which requires the prediction to appear as a genuinely isolated
+token, not a prefix/suffix of a larger word. Long, descriptive predictions
+(`"the probe returns a value between 10 and 50"`) stay on the original
+substring path — they're specific enough that a substring hit is genuinely
+meaningful. When both branches fail to match (ambiguous result), the existing
+correct fallback to `observation.success` is preserved unchanged.
+
+**17b — Useless lesson text in `extraction.py`**
+
+The common case in `_lesson()` — any observation where hypothesis confidence
+moved but didn't cross a terminal threshold — returned the string `"Routine,
+expected outcome."`. This covers the **majority** of all observations (most
+steps are incremental, not decisive). A lesson that says nothing gets
+extracted, stored, and eventually clustered by `consolidation.py` into a
+Principle that also says nothing — wasting the whole memory pipeline's work on
+that episode.
+
+Fixed by describing the actual incremental update: which hypothesis moved, in
+which direction, by how much, and to what current confidence. Lessons extracted
+from incremental steps now cluster usefully with other incremental steps on the
+same hypothesis, and carry enough signal that a future consolidation pass can
+recognize "this kind of action consistently moved this kind of hypothesis toward
+confirmation" as a real learnable pattern.
+
+**17c — Planning prompt blind beyond 3 steps (`planning.py`)**
+
+The planning prompt showed only `state.observations[-3:]` — the last 3
+observations. In a run of more than 3 steps, the planner was completely blind
+to everything earlier, including:
+
+- Confirmed/rejected hypotheses from early in the run (so it would
+  re-propose hypotheses that were already settled, wasting
+  `integrate_new()` calls and burning steps re-testing closed questions)
+- Actions that resolved an early hypothesis (so it couldn't build on
+  "we already know X via action Y" when deciding what angle to test next)
+
+Fixed by adding two blocks to the prompt alongside the existing 3-step
+recency window:
+
+1. **`EARLIER OBSERVATIONS`** — a compact summary (action id, success, first
+   60 chars of result) of all observations beyond the recency window, so the
+   planner knows what happened without paying the token cost of full detail
+   on old steps.
+2. **`SETTLED HYPOTHESES`** — all terminal (CONFIRMED/REJECTED) hypotheses
+   with their evidence counts, explicitly labelled "do NOT re-propose or
+   re-test these." Visible regardless of how long ago they were resolved.
+
+The recency window stays exactly as-is — this adds what it was silently
+dropping, not replaces it.
+
+146/146 tests pass (123 prior + 23 new), zero regressions.
+
+## Phase 16 — Live Quality Feedback (closing the read-only mid-run gap)
+
+The README has flagged this gap explicitly since Phase 6: *"The Phase 6
+quality report is read-only mid-run — it does not yet feed back into
+in-run decision-making (e.g. becoming more conservative the moment quality
+starts dropping)."* Phases 7–15 never closed it. This phase does.
+
+**What was wrong:** `reasoning_quality.build_report()` runs exactly once,
+after `Brain.run()` completes — a retrospective pass. Inside the live loop
+nothing ever reads a running quality picture. A run where quality
+deteriorates sharply (oscillating hypotheses, repeated challenger overrides,
+overconfidence, repeated invalid actions) kept proposing and deciding at
+full speed even as its own process was signalling unreliability. The
+existing strategy-switch trigger (`meta.should_change_strategy`) catches
+stalls — uncertainty plateaus — but says nothing about process quality. A
+Brain actively producing hypotheses and taking actions while being
+systematically overconfident and ignoring its own self-critique got no
+additional signal asking it to slow down.
+
+**`brain/quality_gate.py` (new)** — `evaluate(state, calibration_tracker)`
+runs once per step before `DecisionEngine.decide()`. Checks four signals
+already tracked in `WorkingState`:
+
+1. Any hypothesis with `OSCILLATION_REVERSAL_THRESHOLD`+ confidence
+   reversals (same threshold as the retrospective report, so both tools
+   agree on "bad")
+2. Challenger overrides ≥ 2 (two+ means the first didn't fix the tendency)
+3. `CalibrationTracker.is_overconfident()` (same live tracker the
+   retrospective report already reads)
+4. Rejected actions ≥ 3 (the plan-propose-validate loop is broken)
+
+**Conservative mode** triggers when ≥ 2-of-4 signals are active — same
+"multiple signals together" bar that `ReasoningQualityReport.is_low_quality`
+already uses, so both instruments agree on "bad." When active:
+
+- **`DecisionEngine`** applies a quality-conservatism overlay: duplicate
+  penalty ×3 (much more reluctant to re-try things that have already
+  failed), info-gain weight ×1.5 (demands more expected value before
+  committing to an action). Both are multipliers on the existing scoring
+  path, not a different algorithm — the scoring logic is unchanged, only
+  the bar is raised. Tests verify a high-info-gain action still beats a
+  low-value one even in conservative mode.
+- **`meta.py`** gets a new `live_quality_degraded` signal that triggers
+  escalation to the strong model for the next planning step — so the plan
+  for what to test next gets stronger reasoning behind it when the process
+  looks shaky.
+
+**Not sticky:** conservative mode is re-evaluated from scratch every step.
+If a strategy switch clears the oscillating trajectory and the challenger
+calms down, the signal clears automatically and Brain returns to normal
+scoring on the very next step.
+
+**Integrated with the retrospective report:** `state.conservative_mode_steps`
+tracks how many steps ran in conservative mode. If that count is > 33% of
+total steps, `build_report()` flags it — meaning the final retrospective
+knows the process was degraded for a sustained portion of the run, not just
+a transient hiccup.
+
+**No new Brain constructor parameters needed.** This runs automatically
+inside the loop. The retrospective report's `conservative_mode_steps` field
+is new (zero by default — backward-compatible with any code that reads the
+report).
+
+123/123 tests pass (110 prior + 13 new), zero regressions.
+
 ## Installing / connecting from another repo (e.g. agent65)
 
 This is now a real installable package, not a directory that needs
@@ -453,6 +690,17 @@ brain/
                               cross-project Principle lookup) +
                               seed_hypotheses_from_principles (damped
                               abductive seeding, once per run)
+  similarity.py             - Phase 11: SimilarityScorer interface +
+                              LexicalOverlapScorer (default, zero-dep) /
+                              TfidfCosineScorer / LLMSemanticScorer
+  contradiction.py          - Phase 13/14: ContradictionScorer interface +
+                              LLMContradictionScorer + find_active_tensions
+  confirmation_review.py    - Phase 15: ConfirmationReviewer interface +
+                              LLMConfirmationReviewer + needs_review thin-
+                              evidence gate
+  quality_gate.py           - Phase 16: evaluate() — lightweight per-step
+                              quality tracker; conservative_mode flag fed
+                              to DecisionEngine and meta escalation
   core.py                   - Brain: orchestrates the full cycle. No domain imports.
 toy_envs/
   guess_number.py     - numeric bisection toy
@@ -580,11 +828,19 @@ freellmapi instance isn't reachable from this sandbox.
 
 ## What's deliberately NOT here yet
 
+**Note:** this section predates Phases 13-15. Two items it originally
+listed — cross-hypothesis contradiction detection, and verification-time
+escalation on near-confirmations — are no longer open; see the Phase 13/14
+and Phase 15 sections above. Left the rest of this list as-is rather than
+silently editing history:
+
 - Confidence calibration is still not auto-applied to belief updates
   (unchanged from Phase 4 - still needs real project volume to be
   trustworthy).
-- Real semantic (embedding-based) clustering for consolidation.
-- Cross-hypothesis contradiction detection.
+- Real semantic (embedding-based) clustering for consolidation - Phase 11
+  added a *pluggable* similarity interface (word-overlap / TF-IDF / LLM),
+  but a true embedding-vector implementation still doesn't exist; see the
+  Phase 15 section's "honest next candidates" above.
 - Strategies are hand-written, not learned or LLM-authored - synthesizing
   new strategies from consolidated Principles is a real future candidate,
   but needs real usage data to judge whether it's worthwhile at all.
@@ -593,10 +849,6 @@ freellmapi instance isn't reachable from this sandbox.
   in-run decision-making (e.g. becoming more conservative the moment
   quality starts dropping). See the Phase 6 section above for why that
   was deliberately deferred rather than built speculatively.
-- Escalation currently only affects the reasoning/planning step, not
-  hypothesis belief-update math itself - a "the strong model should also
-  double-check a near-confirmation before it locks in" verification-time
-  escalation is a reasonable, narrow follow-up.
 - Benchmark suite vs. a non-Brain baseline agent65.
 
 ## Gaps closed in this pass
@@ -637,15 +889,12 @@ defer again:
   overfitting to toys, not real signal. This is exactly the kind of
   constant that should be revisited once agent65 is generating volume,
   not before.
-- Real semantic (embedding-based) clustering for consolidation - still
-  tag-overlap only. Reasonable upgrade, not an architectural gap; adding
-  an embedding dependency before there's a real corpus to cluster would
-  be premature.
-- Cross-hypothesis contradiction detection (e.g. two ACTIVE hypotheses
-  that structurally can't both be true) - genuinely not built. Judged
-  lower priority than the three items above because nothing in the toy
-  environments or agent65's existing hypothesis flow has yet produced a
-  concrete case of this causing a wrong decision - a real instance from
-  actual usage would make a much better test than an invented one.
+- Real semantic (embedding-based) clustering for consolidation - Phase 11
+  made this pluggable but the highest-fidelity option remains an LLM call
+  per comparison, not a cheap embedding vector. Reasonable upgrade, not an
+  architectural gap; adding an embedding dependency before there's a real
+  corpus to cluster would be premature.
 - Benchmark suite vs. a non-Brain baseline agent65 - still deferred until
   there's a real `ProjectAdapter` to benchmark.
+- ~~Cross-hypothesis contradiction detection~~ - built, Phase 13/14.
+- ~~Verification-time escalation on near-confirmations~~ - built, Phase 15.

@@ -29,7 +29,7 @@ from __future__ import annotations
 import copy
 import logging
 
-from . import challenger, controller, meta, reasoning_quality
+from . import challenger, controller, meta, quality_gate, reasoning_quality
 from .calibration import CalibrationTracker
 from .consolidation import PrincipleStore
 from .contradiction import find_active_tensions
@@ -74,6 +74,7 @@ class Brain:
         principle_store: PrincipleStore | None = None,
         hypothesis_scorer=None,
         contradiction_scorer=None,
+        confirmation_reviewer=None,
     ):
         self.llm = llm
         self.project = project
@@ -96,6 +97,15 @@ class Brain:
         # never block a confirmation on a contradiction check (see
         # hypotheses.py).
         self.contradiction_scorer = contradiction_scorer
+        # Phase 15: optional — omitted means a hypothesis that clears
+        # verification.can_confirm() locks in as CONFIRMED immediately,
+        # exactly today's (pre-Phase-15) behavior. When provided, it's
+        # given the chance to hold back a confirmation reached on the
+        # bare minimum of evidence (see confirmation_review.py /
+        # hypotheses.py) — the actual "double-check a near-confirmation
+        # before it locks in" verification-time escalation the README
+        # flagged as a real, still-open gap through Phase 14.
+        self.confirmation_reviewer = confirmation_reviewer
         self.calibration_tracker = calibration_tracker or CalibrationTracker()
         # Was hardcoded to 2, which happened to equal len(STRATEGY_LIBRARY) - 1
         # (the number of non-BALANCED strategies) only by coincidence - the
@@ -166,12 +176,29 @@ class Brain:
                     state.step, len(state.principle_seeds),
                 )
 
+            # Phase 16: lightweight live-quality check before every
+            # plan+decide cycle — distinct from the retrospective
+            # quality_report built once at the end of run(). Answers one
+            # question per step: "is the process looking shaky RIGHT NOW?"
+            # so Brain can be more conservative on its next decision without
+            # waiting for the post-mortem.
+            live_quality = quality_gate.evaluate(state, self.calibration_tracker)
+            conservative_mode = live_quality["conservative_mode"]
+            if conservative_mode:
+                state.conservative_mode_steps += 1
+                logger.info(
+                    "step %s: live quality degraded (%d signal(s) active), "
+                    "entering conservative mode",
+                    state.step, live_quality["active_signal_count"],
+                )
+
             signals = meta.compute_signals(
                 state,
                 self.calibration_tracker,
                 relevant_principle_count=(
                     len(relevant_principles) if self.principle_retriever is not None else None
                 ),
+                live_quality_degraded=conservative_mode,
             )
             planner = self.planning
             if self.planning_strong is not None and meta.should_escalate(signals):
@@ -199,7 +226,11 @@ class Brain:
                 # isn't one; there's nothing to have stalled on yet.
                 state.uncertainty_history.append(state.uncertainty.overall)
 
-            decision = self.decision.decide(candidates, state, current_strategy, active_tensions=self._active_tensions(state))
+            decision = self.decision.decide(
+                candidates, state, current_strategy,
+                active_tensions=self._active_tensions(state),
+                conservative_mode=conservative_mode,
+            )
             decision = challenger.review(decision, state)  # deterministic self-critique
             state.decisions.append(decision)
             action = decision.chosen_action
@@ -237,7 +268,11 @@ class Brain:
             state.observations.append(obs)
 
             self.hypotheses.update_from_observation(
-                state, action, obs, contradiction_scorer=self.contradiction_scorer
+                state,
+                action,
+                obs,
+                contradiction_scorer=self.contradiction_scorer,
+                confirmation_reviewer=self.confirmation_reviewer,
             )
             hyp_after = self._find_hypothesis(state, action.tests_hypothesis)
 

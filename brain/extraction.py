@@ -120,4 +120,27 @@ def _lesson(
                 f"Prediction for '{hyp_before.statement}' being true did NOT hold; "
                 f"evidence pointed the other way."
             )
-    return "Routine, expected outcome."
+
+    # Phase 17b: the original code returned "Routine, expected outcome." here,
+    # which covers the MAJORITY of observations (any step where confidence moved
+    # but a hypothesis didn't reach a terminal status). A useless lesson like
+    # that gets extracted, stored, and potentially clustered into a Principle
+    # that says nothing useful. The issue is not that the observation was
+    # unimportant — it may have meaningfully shifted a hypothesis — but that
+    # the lesson didn't capture WHAT it shifted or HOW. Fixed by describing
+    # the actual incremental update rather than discarding it as "routine."
+    if hyp_after is not None:
+        direction = "increased" if (
+            hyp_after.confidence > (hyp_before.confidence if hyp_before else 0.5)
+        ) else "decreased"
+        delta = abs(hyp_after.confidence - (hyp_before.confidence if hyp_before else 0.5))
+        return (
+            f"Action '{action.kind}' provided incremental evidence for "
+            f"'{hyp_after.statement}': confidence {direction} by {delta:.2f} "
+            f"to {hyp_after.confidence:.2f} (still active, not yet confirmed/rejected)."
+        )
+
+    return (
+        f"Action '{action.kind}' executed successfully (no hypothesis directly tested); "
+        f"result: {str(observation.result)[:120]!r}."
+    )

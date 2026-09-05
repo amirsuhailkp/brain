@@ -27,6 +27,16 @@ STOP_PENALTY = -0.5
 # win. Additive (not multiplicative) so it can't invert the ranking of
 # two low-value actions into something that looks falsely important.
 CONTRADICTION_RESOLUTION_BONUS = 0.5
+# Phase 16: when quality_gate.evaluate() says conservative_mode is active,
+# these two adjustments raise the bar on what actions Brain is willing to
+# commit to. The duplicate penalty multiplier makes Brain more reluctant to
+# burn steps re-trying things it has already tried (which is a likely cause
+# of oscillation); the info_gain multiplier means it demands more expected
+# value before acting. Both are multipliers on their normal values, not
+# replacements, so the existing scoring logic stays exactly the same path —
+# conservative mode is a scaling overlay, not a different scoring algorithm.
+CONSERVATIVE_DUPLICATE_PENALTY_MULTIPLIER = 3.0   # 3x reluctance to repeat
+CONSERVATIVE_INFO_GAIN_MULTIPLIER = 1.5            # 1.5x demand for expected value
 
 
 class DecisionEngine:
@@ -36,13 +46,22 @@ class DecisionEngine:
         state: WorkingState,
         strategy: Strategy = BALANCED,
         active_tensions: dict[str, str] | None = None,
+        conservative_mode: bool = False,
     ) -> Decision:
         """`active_tensions` (Phase 14): None/empty (the default) is the
         exact original Phase 2-5 scoring — every pre-Phase-14 call site
         is unaffected. Passing state.active_tensions lets an action that
         would help resolve a live fork between two of Brain's own
         hypotheses outrank an otherwise-similar alternative that
-        wouldn't."""
+        wouldn't.
+
+        `conservative_mode` (Phase 16): False (the default) is the exact
+        original scoring — all pre-Phase-16 call sites are unaffected.
+        True applies a quality-conservatism overlay (stricter duplicate
+        penalty, higher info_gain demand) when the live quality tracker
+        says the process is looking shaky. See quality_gate.py and the
+        module-level constants for the exact multipliers and their
+        rationale."""
         if not candidates:
             # Real bug found 2026-08-29: reason_and_plan() deliberately
             # swallows any LLM failure and returns ([], []) (see its own
@@ -68,18 +87,21 @@ class DecisionEngine:
                 rationale="no candidates available — stopping rather than crashing",
             )
 
-        scored = [(self._score(c, state, strategy, active_tensions), c) for c in candidates]
+        scored = [(self._score(c, state, strategy, active_tensions, conservative_mode), c) for c in candidates]
         scored.sort(key=lambda t: t[0], reverse=True)
         best_score, best_action = scored[0]
 
         rationale_parts = [
-            f"selected '{best_action.kind}' (score={best_score:.2f}, strategy={strategy.name})"
+            f"selected '{best_action.kind}' (score={best_score:.2f}, strategy={strategy.name}"
+            + (", conservative_mode=ON" if conservative_mode else "") + ")"
         ]
         if best_action.tests_hypothesis:
             gain = expected_information_gain(best_action, state)
             rationale_parts.append(f"expected information gain={gain:.3f}")
         if active_tensions and best_action.tests_hypothesis in active_tensions:
             rationale_parts.append("prioritized: resolves a live contradiction with another active hypothesis")
+        if conservative_mode:
+            rationale_parts.append("quality-conservatism overlay active: raised bar on duplicates and info gain demand")
         if len(scored) > 1:
             rationale_parts.append(
                 f"over {len(scored) - 1} other candidate(s), next best scored {scored[1][0]:.2f}"
@@ -98,15 +120,22 @@ class DecisionEngine:
         state: WorkingState,
         strategy: Strategy,
         active_tensions: dict[str, str] | None = None,
+        conservative_mode: bool = False,
     ) -> float:
         score = 0.0
 
+        dup_penalty = DUPLICATE_PENALTY
+        gain_weight = strategy.info_gain_weight
+        if conservative_mode:
+            dup_penalty *= CONSERVATIVE_DUPLICATE_PENALTY_MULTIPLIER
+            gain_weight *= CONSERVATIVE_INFO_GAIN_MULTIPLIER
+
         if self._is_duplicate(action, state):
-            score += DUPLICATE_PENALTY
+            score += dup_penalty
 
         gain = expected_information_gain(action, state)
         cost = max(action.cost, 0.1) * strategy.cost_sensitivity
-        score += (gain / cost) * strategy.info_gain_weight
+        score += (gain / cost) * gain_weight
 
         if action.kind == "stop":
             score += STOP_PENALTY

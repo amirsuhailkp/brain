@@ -7,8 +7,10 @@ from .memory import JsonlMemory, score_importance
 from .planning import PlanningEngine
 from .priors import PrincipleRetriever, seed_hypotheses_from_principles
 from .similarity import SimilarityScorer, LexicalOverlapScorer, TfidfCosineScorer, LLMSemanticScorer
+from .contradiction import ContradictionScorer, LLMContradictionScorer, find_active_tensions
+from .confirmation_review import ConfirmationReviewer, LLMConfirmationReviewer, needs_review
 from .uncertainty import compute_uncertainty
-from . import challenger, controller, verification, meta, reasoning_quality
+from . import challenger, controller, verification, meta, quality_gate, reasoning_quality
 from .calibration import CalibrationTracker, CalibrationRecord
 from .reasoning_quality import ReasoningQualityReport, build_report
 from .consolidation import consolidate, PrincipleStore
@@ -41,12 +43,19 @@ __all__ = [
     "LexicalOverlapScorer",
     "TfidfCosineScorer",
     "LLMSemanticScorer",
+    "ContradictionScorer",
+    "LLMContradictionScorer",
+    "find_active_tensions",
+    "ConfirmationReviewer",
+    "LLMConfirmationReviewer",
+    "needs_review",
     "compute_uncertainty",
     "expected_information_gain",
     "challenger",
     "controller",
     "verification",
     "meta",
+    "quality_gate",
     "reasoning_quality",
     "CalibrationTracker",
     "CalibrationRecord",

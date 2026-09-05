@@ -123,11 +123,52 @@ class PlanningEngine:
         strategy_directive: str = "",
         principles: list | None = None,
     ) -> str:
+        # Phase 17c: the original code showed only the last 3 observations
+        # (`state.observations[-3:]`). In a run of more than 3 steps, the
+        # planner was completely blind to everything before the third-to-last
+        # step — including confirmed/rejected hypotheses from early in the run
+        # and the actions that settled them. This matters because:
+        #   a) The planner was re-proposing hypotheses that were already settled
+        #      (it couldn't see they were already CONFIRMED/REJECTED), which
+        #      confuses integrate_new() and wastes steps.
+        #   b) Actions that resolved an early hypothesis were invisible, so the
+        #      planner couldn't build on "we already know X via action Y" when
+        #      deciding what angle to test next.
+        # Fix: keep the rolling 3-observation window for recency, but separately
+        # surface (a) all terminal hypothesis outcomes with the action that
+        # settled them, and (b) a compact summary of earlier observations beyond
+        # the 3-step window. Neither replacement nor supplement — the recency
+        # window stays; this adds the context it was silently dropping.
         recent_obs = state.observations[-3:]
         obs_text = "\n".join(
             f"- action={o.action_id} success={o.success} result={o.result!r}"
             for o in recent_obs
         ) or "(none yet)"
+
+        earlier_obs = state.observations[:-3] if len(state.observations) > 3 else []
+        if earlier_obs:
+            earlier_summary = (
+                f"\nEARLIER OBSERVATIONS (steps 1–{state.step - len(recent_obs)}, "
+                f"{len(earlier_obs)} total, summarised to avoid context overflow):\n"
+                + "\n".join(
+                    f"- step≈{i+1}: action={o.action_id} success={o.success} result={str(o.result)[:60]!r}"
+                    for i, o in enumerate(earlier_obs)
+                )
+            )
+        else:
+            earlier_summary = ""
+
+        # All terminal hypotheses and the evidence trail that settled them —
+        # visible regardless of how long ago they were resolved.
+        settled_hyps = [h for h in state.hypotheses if h.status.value != "active"]
+        if settled_hyps:
+            settled_text = "\nSETTLED HYPOTHESES (do NOT re-propose or re-test these):\n" + "\n".join(
+                f"- [{h.status.value}] '{h.statement}' "
+                f"(supporting: {len(h.supporting_evidence)}, contradicting: {len(h.contradicting_evidence)} obs)"
+                for h in settled_hyps
+            ) + "\n"
+        else:
+            settled_text = ""
 
         hyps_text = "\n".join(
             f"- id={h.id} [{h.status.value}] conf={h.confidence:.2f}: {h.statement}"
@@ -188,6 +229,27 @@ class PlanningEngine:
                     + "\n".join(lines) + "\n"
                 )
 
+        holds_block = ""
+        if state.confirmation_holds:
+            by_id = {h.id: h for h in state.hypotheses}
+            lines = []
+            for hyp_id, reason in state.confirmation_holds.items():
+                hyp = by_id.get(hyp_id)
+                if hyp:
+                    lines.append(
+                        f'- "{hyp.statement}" cleared the confirmation threshold on thin '
+                        f"evidence but was HELD, not confirmed"
+                        + (f' — reviewer said: "{reason}"' if reason else "")
+                        + ". Find another, ideally different-angle, action that tests it "
+                        "before treating it as settled."
+                    )
+            if lines:
+                holds_block = (
+                    "\nHELD CONFIRMATIONS (a stronger review judged the evidence too thin — "
+                    "get independent confirmation before relying on these):\n"
+                    + "\n".join(lines) + "\n"
+                )
+
         return f"""You are the reasoning+planning component of a cognitive agent. You
 propose possibilities and options; you do NOT decide which action runs —
 that is chosen by separate deterministic code after you respond, using
@@ -201,9 +263,9 @@ CONSTRAINTS: {', '.join(state.goal.constraints) or '(none)'}
 CURRENT WORLD STATE:
 {json.dumps(state.world_model.snapshot(), indent=2)}
 
-RECENT OBSERVATIONS:
-{obs_text}
-
+RECENT OBSERVATIONS (last {len(recent_obs)} steps):
+{obs_text}{earlier_summary}
+{settled_text}
 CURRENT HYPOTHESES (do not repeat these verbatim, only add genuinely new ones;
 do not propose actions testing an already-confirmed or already-rejected one):
 {hyps_text}
@@ -213,6 +275,7 @@ PROJECT-SPECIFIC CONTEXT:
 {principles_block}
 {contradictions_block}
 {tensions_block}
+{holds_block}
 ALLOWED ACTION KINDS (candidate_actions[].kind MUST be one of these): {allowed_kinds}
 
 Propose:

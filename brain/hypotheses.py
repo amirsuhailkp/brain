@@ -16,6 +16,7 @@ Split responsibility on purpose:
 from __future__ import annotations
 
 from . import verification
+from .confirmation_review import needs_review
 from .models import (
     Action,
     Hypothesis,
@@ -150,6 +151,7 @@ class HypothesisEngine:
         action: Action,
         observation: Observation,
         contradiction_scorer=None,
+        confirmation_reviewer=None,
     ) -> None:
         if not action.tests_hypothesis:
             return  # exploratory action, not tied to any specific belief
@@ -173,11 +175,27 @@ class HypothesisEngine:
         # observation crossing the confidence threshold is treated as
         # "plausible", not "confirmed".
         if verification.can_confirm(hyp, CONFIRM_THRESHOLD):
+            # Phase 15: before anything else, give a stronger model a
+            # chance to hold a THIN-evidence confirmation back — this runs
+            # first because a hold means "not actually confirming yet,"
+            # which makes the contradiction check below moot for this step
+            # (nothing new is being asserted as CONFIRMED to check against
+            # other CONFIRMED beliefs).
+            if confirmation_reviewer is not None and needs_review(hyp):
+                approved, reason = confirmation_reviewer.review(
+                    hyp.statement, hyp.supporting_evidence
+                )
+                if not approved:
+                    state.confirmation_holds[hyp.id] = reason or "held for additional evidence"
+                    self._clear_stale_contradictions(state)
+                    return
+
             conflict = None
             if contradiction_scorer is not None:
                 conflict = self._find_confirmed_contradiction(hyp, state, contradiction_scorer)
             if conflict is None:
                 hyp.status = HypothesisStatus.CONFIRMED
+                state.confirmation_holds.pop(hyp.id, None)
             else:
                 # Evidence alone supports confirming this hypothesis, but
                 # Brain cannot accept two mutually-exclusive CONFIRMED
@@ -188,6 +206,7 @@ class HypothesisEngine:
                 state.contradictions[hyp.id] = conflict.id
         elif verification.can_reject(hyp, REJECT_THRESHOLD):
             hyp.status = HypothesisStatus.REJECTED
+            state.confirmation_holds.pop(hyp.id, None)
 
         self._clear_stale_contradictions(state)
 
@@ -226,27 +245,66 @@ class HypothesisEngine:
         """Prefer the explicit counterfactual (predicted_if_true vs
         predicted_if_false) when both are given — that's a real
         distinguishing test. Fall back to the old single-prediction
-        heuristic for actions that only set predicted_outcome."""
+        heuristic for actions that only set predicted_outcome.
+
+        Phase 17a — word-boundary matching: the original implementation
+        used a raw `predicted_if_true in actual` substring test. That
+        silently misfires on very common short prediction tokens:
+          - "high" matches "highway", "highlight", "highly"
+          - "low" matches "flow", "below", "allow"
+          - "yes" matches "yesterday", "bytes"
+          - "no" matches "node", "noise", "not"
+        These aren't edge cases — they're the exact vocabulary an LLM
+        naturally uses when asked to predict outcomes in plain English.
+        A false positive here means a contradicting observation gets
+        recorded as supporting evidence (or vice versa), corrupting the
+        confidence trajectory and calibration tracker for that hypothesis
+        for the rest of the run — silently, with no error, because the
+        matched=True/False path executes normally either way.
+
+        Fix: use whole-word matching (\\b word boundaries via `re`) when
+        the prediction is a short token (< 20 chars) that would otherwise
+        be prone to substring collision. Long, descriptive predictions
+        (like "the probe returns a value between 10 and 50") are kept on
+        the old `in` path — they're specific enough that a substring hit
+        is genuinely meaningful, and the boundary check adds noise for
+        multi-word phrases.
+
+        `re` is stdlib; no new dependency introduced."""
+        import re
+
         actual = str(observation.result).strip().lower()
 
+        def _matches(prediction: str, text: str) -> bool:
+            pred = prediction.strip().lower()
+            if not pred:
+                return False
+            # Short tokens get word-boundary protection; long phrases keep
+            # the original substring path (they're already specific enough).
+            # Use negative lookarounds (not \b) because \b still matches at
+            # the START of a word boundary — "yes" has \b before "y" in
+            # "yesterday", so \b alone doesn't protect against that false hit.
+            # (?<!\w)pred(?!\w) requires the token NOT to be immediately
+            # preceded or followed by a word character, which is the correct
+            # "fully isolated token" check.
+            if len(pred) < 20:
+                try:
+                    pattern = r'(?<!\w)' + re.escape(pred) + r'(?!\w)'
+                    return bool(re.search(pattern, text))
+                except re.error:
+                    return pred in text
+            return pred in text
+
         if action.predicted_if_true or action.predicted_if_false:
-            true_hit = (
-                action.predicted_if_true.strip().lower() in actual
-                if action.predicted_if_true
-                else False
-            )
-            false_hit = (
-                action.predicted_if_false.strip().lower() in actual
-                if action.predicted_if_false
-                else False
-            )
+            true_hit = _matches(action.predicted_if_true, actual) if action.predicted_if_true else False
+            false_hit = _matches(action.predicted_if_false, actual) if action.predicted_if_false else False
             if true_hit and not false_hit:
                 return True
             if false_hit and not true_hit:
                 return False
-            return bool(observation.success)  # ambiguous - weak fallback signal
+            return bool(observation.success)  # ambiguous — weak fallback signal
 
         predicted = action.predicted_outcome.strip().lower()
         if not predicted:
             return bool(observation.success)
-        return predicted in actual or actual in predicted
+        return _matches(predicted, actual) or actual in predicted

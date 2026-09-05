@@ -177,6 +177,19 @@ class WorkingState:
     # DecisionEngine to prioritize the action that would help resolve the
     # fork (see contradiction.find_active_tensions).
     active_tensions: dict[str, str] = field(default_factory=dict)
+    # Phase 15: a hypothesis id that satisfied verification.can_confirm()
+    # (threshold + independent-evidence count) on THIN evidence -> the
+    # ConfirmationReviewer's stated reason for holding it at ACTIVE instead
+    # of letting it lock in as CONFIRMED. Cleared automatically the moment
+    # that hypothesis reaches a real terminal status (see
+    # HypothesisEngine.update_from_observation) — a hold is a "not yet",
+    # never a permanent veto.
+    confirmation_holds: dict[str, str] = field(default_factory=dict)
+    # Phase 16: how many steps this run were decided in conservative mode
+    # (quality_gate.evaluate() said the process looked shaky). Inspectable
+    # (Principle 13); a high count relative to max_steps is itself worth
+    # flagging in the retrospective quality report.
+    conservative_mode_steps: int = 0
 
 
 @dataclass

@@ -69,6 +69,7 @@ class ReasoningQualityReport:
     rejected_actions: int
     strategy_switches: int
     escalations: int
+    conservative_mode_steps: int = 0  # Phase 16: how many steps ran in conservative mode
     oscillating_hypotheses: list[str] = field(default_factory=list)  # hypothesis ids
     flags: list[str] = field(default_factory=list)  # human-readable, inspectable issues
     overall_quality: float = 1.0  # 0 = reasoning process looked unreliable, 1 = clean
@@ -121,6 +122,17 @@ def build_report(state: WorkingState, calibration_tracker: CalibrationTracker) -
         flags.append(f"had to abandon the initial strategy {state.strategy_switches} time(s)")
     if rejected_actions >= 3:
         flags.append(f"{rejected_actions} proposed actions were invalid and rejected before execution")
+    # Phase 16: if the live quality gate was active for more than a third of
+    # the run, that's worth flagging — it means the process was in a
+    # degraded state for a sustained period, not just a transient hiccup.
+    conservative_mode_steps = getattr(state, "conservative_mode_steps", 0)
+    max_steps_estimate = max(state.step, 1)
+    if conservative_mode_steps > 0 and conservative_mode_steps / max_steps_estimate >= 0.33:
+        flags.append(
+            f"live quality gate was active for {conservative_mode_steps}/{state.step} steps "
+            f"({conservative_mode_steps / max_steps_estimate:.0%} of the run) — process was "
+            f"in conservative mode for a sustained period"
+        )
 
     # Simple additive penalty, not a tuned weighted score - same philosophy
     # as decision.py and meta.py: each penalty is individually explainable,
@@ -140,6 +152,7 @@ def build_report(state: WorkingState, calibration_tracker: CalibrationTracker) -
         rejected_actions=rejected_actions,
         strategy_switches=state.strategy_switches,
         escalations=state.escalations,
+        conservative_mode_steps=conservative_mode_steps,
         oscillating_hypotheses=oscillating,
         flags=flags,
         overall_quality=round(overall_quality, 3),

@@ -48,6 +48,7 @@ def compute_signals(
     state: WorkingState,
     calibration_tracker: CalibrationTracker,
     relevant_principle_count: int | None = None,
+    live_quality_degraded: bool = False,
 ) -> dict:
     """`relevant_principle_count` (Phase 8): how many active cross-project
     Principles the PrincipleRetriever judged relevant to the CURRENT step's
@@ -76,6 +77,19 @@ def compute_signals(
         # stronger reasoning to resolve, not just more of the same cheap
         # planning loop that got it into this state.
         "unresolved_contradiction": bool(state.contradictions),
+        # Phase 15: a ConfirmationReviewer already judged a thin-evidence
+        # confirmation not yet trustworthy this run — the planning step
+        # that decides what to test next should get the strong model's
+        # judgment too, not just the confirmation check itself, since
+        # picking the RIGHT next piece of evidence is exactly what
+        # resolves a hold fastest.
+        "unresolved_confirmation_hold": bool(state.confirmation_holds),
+        # Phase 16: quality_gate.evaluate() saw multiple process-quality
+        # signals fire together this step (oscillating hypotheses +
+        # repeated challenger overrides, etc.) — the plan for what to do
+        # next should get stronger reasoning, not the same cheap model
+        # that just produced a shaky process.
+        "live_quality_degraded": live_quality_degraded,
     }
 
 
@@ -98,6 +112,10 @@ def should_escalate(signals: dict) -> bool:
     if signals.get("unfamiliar_domain_first_look"):
         return True
     if signals.get("unresolved_contradiction"):
+        return True
+    if signals.get("unresolved_confirmation_hold"):
+        return True
+    if signals.get("live_quality_degraded"):
         return True
     return False
 
