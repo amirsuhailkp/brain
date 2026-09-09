@@ -123,5 +123,5 @@ class MemoryBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def query(self, tags: list[str] | None = None, limit: int = 10) -> list:
+    def query(self, tags: list[str] | None = None, limit: int = 10, require_all_tags: bool = False) -> list:
         raise NotImplementedError

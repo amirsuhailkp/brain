@@ -289,7 +289,7 @@ class Brain:
                 # crash isn't.
                 self._extract_and_store_observation_experience(state, action, obs, hyp_before, None)
                 state.world_model.update(self.project.perceive())
-                if controller.is_stalled(state) or controller.is_in_action_rut(state):
+                if controller.is_stalled(state) or controller.is_in_action_rut(state, allowed_kinds):
                     switched, current_strategy = self._try_change_strategy(state, current_strategy)
                     if not switched:
                         state.stopped = True
@@ -315,7 +315,39 @@ class Brain:
 
             state.world_model.update(self.project.perceive())
 
-            if controller.is_stalled(state) or controller.is_in_action_rut(state):
+            # Phase 20a: check is_goal_met AFTER the world model is
+            # updated, and if the goal is now met, confirm the hypothesis
+            # that the winning action was testing before breaking. Without
+            # this, the winning hypothesis stays ACTIVE at confidence 0.75
+            # with only 1 supporting observation — because the goal_met
+            # check at the top of the next loop iteration fires and breaks
+            # BEFORE update_from_observation could be called again. The
+            # episode summary then records n_confirmed=0 even on a perfect
+            # run, and calibration records an unresolved hypothesis instead
+            # of a correct prediction.
+            #
+            # Implementation: if goal is now met AND this action was testing
+            # a hypothesis that is still ACTIVE (not already confirmed/
+            # rejected by the regular update above), directly mark it
+            # CONFIRMED — we know it was right because the goal just got
+            # met. This bypasses the MIN_CONFIRMATIONS count deliberately:
+            # a goal-met outcome IS the ultimate corroboration that the
+            # hypothesis was correct.
+            if self.project.is_goal_met(state.world_model):
+                if action.tests_hypothesis:
+                    winning_hyp = self._find_hypothesis(state, action.tests_hypothesis)
+                    if winning_hyp is not None and winning_hyp.status == HypothesisStatus.ACTIVE:
+                        winning_hyp.status = HypothesisStatus.CONFIRMED
+                        state.confirmation_holds.pop(winning_hyp.id, None)
+                        logger.info(
+                            "step %s: goal met — confirmed hypothesis '%s' as correct",
+                            state.step, winning_hyp.statement[:60],
+                        )
+                state.stopped = True
+                state.stop_reason = "goal_met"
+                break
+
+            if controller.is_stalled(state) or controller.is_in_action_rut(state, allowed_kinds):
                 switched, current_strategy = self._try_change_strategy(state, current_strategy)
                 if not switched:
                     state.stopped = True

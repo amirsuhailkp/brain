@@ -493,6 +493,60 @@ that they matter:
    which of these fifteen phases is actually pulling its weight day to
    day.
 
+## Phase 19 — Four More Gaps Found by Reading Every Module
+
+**19a — World-model-aware exploration scoring (`information_gain.py`)**
+
+Every exploratory action (no `tests_hypothesis`) returned a flat
+`EXPLORATION_BASE_GAIN = 0.15` regardless of what it was actually exploring.
+An action reading a field mentioned by three live hypothesis statements scored
+identically to one reading a field nobody was reasoning about. The world model
+and hypothesis list were both available; nothing read them for this purpose.
+
+Fixed with `_exploration_gain()`: if any of the action's param values contain
+a word already present in an active hypothesis statement (word-overlap, no
+embeddings, no LLM), the gain is `0.15 × 1.8 = 0.27`. Only ACTIVE hypotheses
+contribute vocabulary (CONFIRMED/REJECTED ones are settled). Short words ≤ 2
+chars are filtered out (stop words). The counterfactual path for
+hypothesis-tied actions is completely unchanged.
+
+**19b — Duplicate-action blind spot in self-critique (`challenger.py`)**
+
+`DecisionEngine._is_duplicate()` already applies a `−1000` penalty in scoring,
+but when every candidate is a duplicate the penalty makes all scores equally
+bad and one still wins. `challenger.py` had no check for this: it only looked
+at whether the chosen action targeted a settled hypothesis or had identical
+predictions — not whether it had literally already been executed with the same
+params. Added a third `_find_issue()` check: if `(kind, sorted_params)` matches
+any EXECUTED action in history, the challenger flags it and switches to the
+best issue-free alternative. Also fixed `_best_alternative` to use `>=` instead
+of `>` for the comparison: a fresh alternative with the same nominal score as
+a duplicate is not actually equivalent (it hasn't been tried), and `>` was
+causing the challenger to annotate-but-not-switch when both scored identically
+as exploratory actions.
+
+**19c — Sparse-data calibration bias (`calibration.py`)**
+
+`is_overconfident()` computed a mean gap across all calibration bins equally.
+A single early high-confidence wrong answer in a bin with 1 record got the same
+weight as a bin with 20 records — dominating the average when data was sparse.
+Fixed with a `min_bin_samples=3` guard: bins with fewer than 3 records are
+excluded from the average. Returns `False` conservatively if no bin qualifies
+(same as no data at all). The threshold is a named parameter, not a magic
+constant — callers can tune it.
+
+**19d — Tag-OR-only query precision (`memory.py`)**
+
+`JsonlMemory.query(tags=["probe", "goal_met"])` returned every experience with
+ANY of those tags — every probe ever run PLUS every goal-met run — giving low
+retrieval precision from the first memory query ever made. There was no way to
+say "I want experiences that are BOTH probe AND goal_met." Added
+`require_all_tags=False` (default, unchanged OR behaviour) and
+`require_all_tags=True` (AND: only experiences with ALL requested tags). Also
+updated `MemoryBackend.query()` abstract signature to match.
+
+191/191 tests pass (167 prior + 24 new), zero regressions.
+
 ## Phase 18 — Three More Real Bugs, Found by Reading the Code
 
 **18a — Action-rut detection (`controller.py`)**

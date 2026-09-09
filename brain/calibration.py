@@ -70,12 +70,23 @@ class CalibrationTracker:
             )
         return out
 
-    def is_overconfident(self, threshold: float = 0.15) -> bool:
+    def is_overconfident(self, threshold: float = 0.15, min_bin_samples: int = 3) -> bool:
         """True if, on average, stated confidence runs meaningfully higher
         than actual observed match rate — a concrete, checkable version of
-        'the Brain thinks it knows more than it does'."""
+        'the Brain thinks it knows more than it does'.
+
+        Phase 19c: bins with fewer than `min_bin_samples` records are
+        excluded from the average. A single early high-confidence wrong
+        answer used to dominate the curve when data is sparse (1 record
+        gets the same weight as 20 in a mean-of-gaps calculation). Now only
+        bins with enough samples to be statistically meaningful contribute.
+        The check returns False if no bin meets the threshold — conservative
+        default, same as when there are no records at all."""
         curve = self.calibration_curve()
         if not curve:
             return False
-        avg_gap = sum(c["gap"] for c in curve) / len(curve)
+        qualifying = [c for c in curve if c["n"] >= min_bin_samples]
+        if not qualifying:
+            return False
+        avg_gap = sum(c["gap"] for c in qualifying) / len(qualifying)
         return avg_gap < -threshold

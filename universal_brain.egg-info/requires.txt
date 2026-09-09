@@ -1,3 +1,6 @@
 
 [dev]
 pytest>=7
+
+[similarity]
+scikit-learn>=1.3

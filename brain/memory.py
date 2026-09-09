@@ -52,7 +52,26 @@ class JsonlMemory(MemoryBackend):
         with self.path.open("a") as f:
             f.write(json.dumps(asdict(experience)) + "\n")
 
-    def query(self, tags: list[str] | None = None, limit: int = 10) -> list[Experience]:
+    def query(
+        self,
+        tags: list[str] | None = None,
+        limit: int = 10,
+        require_all_tags: bool = False,
+    ) -> list[Experience]:
+        """Retrieve experiences matching the given tags.
+
+        Phase 19d: `require_all_tags=False` (the default) preserves the
+        original tag-OR behaviour — any experience sharing at least one
+        tag is returned. This is what every existing call site expects.
+
+        `require_all_tags=True` switches to tag-AND: only experiences that
+        have ALL of the requested tags are returned. This is dramatically
+        more precise when the caller knows exactly what combination they
+        need (e.g. planning.py wanting experiences tagged BOTH "probe" AND
+        "goal_met", not every probe ever run plus every goal-met run).
+
+        The default stays False so every existing call site is unaffected.
+        Callers that want AND semantics must opt in explicitly."""
         if not self.path.exists():
             return []
         records: list[Experience] = []
@@ -62,8 +81,15 @@ class JsonlMemory(MemoryBackend):
                 if not line:
                     continue
                 d = json.loads(line)
-                if tags and not (set(tags) & set(d.get("tags", []))):
-                    continue
+                if tags:
+                    exp_tags = set(d.get("tags", []))
+                    req_tags = set(tags)
+                    if require_all_tags:
+                        if not req_tags.issubset(exp_tags):
+                            continue
+                    else:
+                        if not (req_tags & exp_tags):
+                            continue
                 records.append(Experience(**d))
         records.sort(key=lambda e: e.timestamp, reverse=True)
         return records[:limit]

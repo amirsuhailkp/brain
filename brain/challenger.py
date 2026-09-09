@@ -61,6 +61,26 @@ def _find_issue(action, state: WorkingState) -> str | None:
             if same_prediction and (action.predicted_if_true or action.predicted_if_false):
                 return "predicted_if_true and predicted_if_false are identical; this isn't a real distinguishing experiment"
 
+    # Phase 19b: duplicate-execution check. DecisionEngine._is_duplicate()
+    # already applies a large penalty in scoring, but if every candidate is
+    # a duplicate the penalty makes all scores equally bad and one still
+    # wins. The challenger is the right place to name this explicitly:
+    # "you're about to repeat something that has already been tried, and
+    # there may be something better." Uses the same kind+params fingerprint
+    # as DecisionEngine._is_duplicate() so both instruments agree on what
+    # counts as "the same action."
+    executed_fingerprints = {
+        (a.kind, str(sorted(a.params.items())))
+        for a in state.actions_taken
+        if a.status.value == "executed"
+    }
+    action_fp = (action.kind, str(sorted(action.params.items())))
+    if action_fp in executed_fingerprints:
+        return (
+            f"action '{action.kind}' with these exact params has already been executed; "
+            f"repeating it cannot produce new information unless the world state changed"
+        )
+
     return None
 
 
@@ -77,4 +97,16 @@ def _best_alternative(decision: Decision, state: WorkingState):
     scored.sort(key=lambda t: t[0], reverse=True)
     best_gain, best_action = scored[0]
     current_gain = expected_information_gain(decision.chosen_action, state)
-    return best_action if best_gain > current_gain else None
+    # Phase 19b fix: when the chosen action has an identified issue (we
+    # only reach _best_alternative when it does), prefer ANY issue-free
+    # alternative, not just one that scores strictly higher. A duplicate
+    # or non-distinguishing action with the same nominal score as an
+    # alternative is NOT actually equivalent — the alternative hasn't been
+    # tried yet. Strictly-greater was the right bar for the original two
+    # checks (settled-hypothesis, non-distinguishing) but it fails here
+    # because a duplicate and a fresh alternative can score identically
+    # (both exploratory, both no counterfactual) yet only the alternative
+    # is actually informative. ">=" preserves the original behavior for
+    # the two existing checks (they only fire when a better alternative
+    # exists by definition) while fixing the duplicate case.
+    return best_action if best_gain >= current_gain else None

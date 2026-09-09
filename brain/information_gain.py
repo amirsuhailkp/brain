@@ -37,11 +37,62 @@ from .models import Action, Hypothesis, WorkingState
 from .uncertainty import compute_uncertainty
 
 EXPLORATION_BASE_GAIN = 0.15  # nominal value for exploratory actions with no tied hypothesis
+# Phase 19a: a multiplier on EXPLORATION_BASE_GAIN for exploratory actions
+# that touch a world-model key already known to be relevant to at least one
+# ACTIVE hypothesis statement. "Relevant" is a simple word-overlap check —
+# no embeddings, no LLM — but it's enough to distinguish "read the field
+# three of my live hypotheses mention" from "read a field nobody is
+# reasoning about." Both are still exploratory (no counterfactual
+# predictions), but the first is meaningfully more likely to unblock
+# something, and should score higher than a flat 0.15.
+EXPLORATION_RELEVANCE_MULTIPLIER = 1.8
+
+
+def _exploration_gain(action: Action, state: WorkingState) -> float:
+    """Phase 19a: weight exploratory actions by how many of their params
+    overlap with vocabulary already present in active hypothesis statements.
+
+    The intuition: if three live hypotheses all mention "temperature" and
+    the exploratory action reads `params={"field": "temperature"}`, that
+    action is meaningfully more likely to return something useful than
+    one reading `params={"field": "checksum_b"}` that no hypothesis has
+    mentioned. Both are exploratory — neither has a counterfactual — but
+    they're not equally valuable.
+
+    Implementation: collect every word from every ACTIVE hypothesis
+    statement (lowercase, split on whitespace/punctuation), then check
+    how many of the action's params values contain at least one such word.
+    If any do, apply the relevance multiplier; otherwise, return the flat
+    base gain. This is O(hypotheses * param_values * words) but in
+    practice both sides are small (< 10 hypotheses, < 5 params each)."""
+    import re
+    active_hyps = [h for h in state.hypotheses if h.status.value == "active"]
+    if not active_hyps or not action.params:
+        return EXPLORATION_BASE_GAIN
+
+    # Vocabulary from all active hypothesis statements
+    hyp_words: set[str] = set()
+    for h in active_hyps:
+        hyp_words.update(w.lower() for w in re.split(r'\W+', h.statement) if len(w) > 2)
+
+    # Words from action param values (stringify everything)
+    param_words: set[str] = set()
+    for v in action.params.values():
+        param_words.update(w.lower() for w in re.split(r'\W+', str(v)) if len(w) > 2)
+
+    if hyp_words & param_words:
+        return EXPLORATION_BASE_GAIN * EXPLORATION_RELEVANCE_MULTIPLIER
+    return EXPLORATION_BASE_GAIN
 
 
 def expected_information_gain(action: Action, state: WorkingState) -> float:
     if not action.tests_hypothesis:
-        return EXPLORATION_BASE_GAIN
+        # Phase 19a: exploratory actions are not all equally valuable —
+        # one that touches params already mentioned in active hypothesis
+        # statements scores higher than one probing something nobody is
+        # reasoning about. Both are still exploratory (no counterfactual),
+        # but the relevance-weighted score reflects the difference.
+        return _exploration_gain(action, state)
 
     hyp = next((h for h in state.hypotheses if h.id == action.tests_hypothesis), None)
     if hyp is None:

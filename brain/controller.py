@@ -69,7 +69,9 @@ def is_rejection_looping(state: WorkingState) -> bool:
     return all(a.status == ActionStatus.REJECTED for a in recent)
 
 
-def is_in_action_rut(state: WorkingState, streak: int = ACTION_RUT_STREAK) -> bool:
+def is_in_action_rut(
+    state: WorkingState, available_kinds: list[str] | None = None, streak: int = ACTION_RUT_STREAK
+) -> bool:
     """True when the last `streak` EXECUTED (not rejected/failed) actions all
     had the same kind. Rejected and failed actions are excluded because:
       - A rejection streak is already caught by is_rejection_looping().
@@ -77,7 +79,21 @@ def is_in_action_rut(state: WorkingState, streak: int = ACTION_RUT_STREAK) -> bo
         diversify" — two different problems with two different remedies.
     "stop" is excluded because a stop decision is terminal and correct, not
     a rut, and firing this check on it would cause a spurious strategy switch
-    instead of a clean halt."""
+    instead of a clean halt.
+
+    Phase 20b: `available_kinds` — if provided, and only ONE non-stop action
+    kind is available in the current world state, rut detection is suppressed.
+    A domain where the world genuinely only exposes one action kind right now
+    isn't a rut — it's a constraint. Firing a strategy switch in that case
+    produces no benefit (every strategy still only has one action to choose
+    from) and generates spurious quality flags in the retrospective report.
+    None (the default) preserves the original behavior for callers that don't
+    have or pass the available kinds (e.g. tests)."""
+    if available_kinds is not None:
+        real_kinds = [k for k in available_kinds if k != "stop"]
+        if len(real_kinds) <= 1:
+            return False  # only one action type available — not a rut, a constraint
+
     executed = [
         a for a in state.actions_taken
         if a.status == ActionStatus.EXECUTED and a.kind != "stop"
